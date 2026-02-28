@@ -61,7 +61,8 @@ class SessionManager:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(Path.home() / ".nanobot" / "sessions")
+        self.sessions_dir = ensure_dir(self.workspace / "sessions")
+        self.legacy_sessions_dir = Path.home() / ".nanobot" / "sessions"
         self._cache: dict[str, Session] = {}
     
     def _get_session_path(self, key: str) -> Path:
@@ -92,6 +93,13 @@ class SessionManager:
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
+        
+        # Fallback to legacy path if not in workspace
+        if not path.exists():
+            legacy_path = self.legacy_sessions_dir / f"{safe_filename(key.replace(':', '_'))}.jsonl"
+            if legacy_path.exists():
+                path = legacy_path
+                logger.info(f"Loading legacy session for {key} from {legacy_path}")
 
         if not path.exists():
             return None
@@ -157,23 +165,37 @@ class SessionManager:
         Returns:
             List of session info dicts.
         """
-        sessions = []
+        sessions = {}
         
-        for path in self.sessions_dir.glob("*.jsonl"):
+        # Helper to read metadata
+        def _read_meta(p: Path) -> dict | None:
             try:
-                # Read just the metadata line
-                with open(path) as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
+                with open(p) as f:
+                    line = f.readline().strip()
+                    if line:
+                        data = json.loads(line)
                         if data.get("_type") == "metadata":
-                            sessions.append({
-                                "key": path.stem.replace("_", ":"),
+                            return {
+                                "key": p.stem.replace("_", ":"),
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                                "path": str(p)
+                            }
             except Exception:
-                continue
+                pass
+            return None
+
+        # 1. Read workspace sessions
+        if self.sessions_dir.exists():
+            for path in self.sessions_dir.glob("*.jsonl"):
+                if meta := _read_meta(path):
+                    sessions[meta["key"]] = meta
+
+        # 2. Read legacy sessions (don't overwrite workspace ones)
+        if self.legacy_sessions_dir.exists():
+            for path in self.legacy_sessions_dir.glob("*.jsonl"):
+                if meta := _read_meta(path):
+                    if meta["key"] not in sessions:
+                        sessions[meta["key"]] = meta
         
-        return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+        return sorted(sessions.values(), key=lambda x: x.get("updated_at", ""), reverse=True)

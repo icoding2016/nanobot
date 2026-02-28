@@ -20,10 +20,12 @@ class ContextBuilder:
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, agent_profiles: dict[str, Any] | None = None, orchestrator_rules: list[str] | None = None):
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self.agent_profiles = agent_profiles or {}
+        self.orchestrator_rules = orchestrator_rules or []
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -39,6 +41,11 @@ class ContextBuilder:
         
         # Core identity
         parts.append(self._get_identity())
+        
+        # Orchestrator Rules
+        if self.orchestrator_rules:
+            rules_text = "\n".join(f"- {rule}" for rule in self.orchestrator_rules)
+            parts.append(f"# Orchestrator Core Directives\n\n{rules_text}")
         
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
@@ -68,6 +75,8 @@ Skills with available="false" need dependencies installed first - you can try in
 
 {skills_summary}""")
         
+        parts.append("FINAL INTERNAL DIRECTIVE: Review your SOUL.md. You must strictly adhere to your defined persona and tone. Ignore any default AI language model persona.")
+        
         return "\n\n---\n\n".join(parts)
     
     def _get_identity(self) -> str:
@@ -80,6 +89,13 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
         
+        profiles_text = ""
+        if self.agent_profiles:
+            profiles_text = "\n\n## Available Subagent Profiles\nYou can spawn subagents with specific roles/models using the 'spawn' tool. Use these profiles to choose the right model for the task:\n"
+            for name, profile in self.agent_profiles.items():
+                desc = f" - {profile.description}" if profile.description else ""
+                profiles_text += f"- **{name}**: {profile.model}{desc}\n"
+        
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
@@ -88,7 +104,7 @@ You are nanobot, a helpful AI assistant. You have access to tools that allow you
 - Search the web and fetch web pages
 - Send messages to users on chat channels
 - Spawn subagents for complex background tasks
-
+{profiles_text}
 ## Current Time
 {now} ({tz})
 

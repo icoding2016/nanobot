@@ -1,7 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -158,16 +159,63 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
+    models: list[str] = Field(default_factory=lambda: ["anthropic/claude-opus-4-5"])
+    routing_strategy: str = "fallback"
+    orchestrator_rules: list[str] = Field(default_factory=list)
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
 
+    @field_validator('models', mode='before')
+    @classmethod
+    def parse_models(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(',') if x.strip()]
+        if isinstance(v, list):
+            res = []
+            for item in v:
+                if isinstance(item, str):
+                    res.extend([x.strip() for x in item.split(',') if x.strip()])
+                else:
+                    res.append(item)
+            return res
+        return v
+
+
+class AgentProfile(BaseModel):
+    """Configuration for a specific agent profile."""
+    models: list[str] = Field(default_factory=list)
+    description: str | None = None
+    temperature: float | None = None
+
+    @field_validator('models', mode='before')
+    @classmethod
+    def parse_models(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(',') if x.strip()]
+        if isinstance(v, list):
+            res = []
+            for item in v:
+                if isinstance(item, str):
+                    res.extend([x.strip() for x in item.split(',') if x.strip()])
+                else:
+                    res.append(item)
+            return res
+        return v
+
+
+class ShortcutRule(BaseModel):
+    action: str = "spawn"
+    profile: str = ""
+    label: str | None = None
+
 
 class AgentsConfig(BaseModel):
     """Agent configuration."""
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    profiles: dict[str, AgentProfile] = Field(default_factory=dict)
+    shortcuts: dict[str, ShortcutRule] = Field(default_factory=dict)
 
 
 class ProviderConfig(BaseModel):
@@ -234,6 +282,67 @@ class ToolsConfig(BaseModel):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class BudgetConfig(BaseModel):
+    """Budget configuration."""
+    monthly_usd: float = 0.0       # -1 表示无限量
+    monthly_calls: int = 0         # 0 表示不限制，>0 表示每月最大调用次数
+    currency: str = "USD"
+    alert_thresholds: list[float] = Field(default_factory=lambda: [0.6, 0.8])
+    
+    @field_validator('monthly_usd', mode='before')
+    @classmethod
+    def validate_monthly_usd(cls, v: Any) -> float:
+        """Validate monthly_usd: -1 for unlimited, >=0 for limited budget."""
+        if isinstance(v, (int, float)):
+            val = float(v)
+            if val < -1:
+                raise ValueError('monthly_usd must be -1 (unlimited) or >= 0')
+            return val
+        if isinstance(v, str):
+            val = float(v.strip().strip("'\""))
+            if val < -1:
+                raise ValueError('monthly_usd must be -1 (unlimited) or >= 0')
+            return val
+        return 0.0
+    
+    @field_validator('monthly_calls', mode='before')
+    @classmethod
+    def validate_monthly_calls(cls, v: Any) -> int:
+        """Validate monthly_calls: 0 for unlimited, >0 for limited calls."""
+        if isinstance(v, (int, float)):
+            return max(0, int(v))
+        if isinstance(v, str):
+            try:
+                return max(0, int(v.strip().strip("'\"")))
+            except ValueError:
+                return 0
+        return 0
+    
+    @field_validator('alert_thresholds', mode='before')
+    @classmethod
+    def parse_alert_thresholds(cls, v: Any) -> list[float]:
+        """Parse alert thresholds from various formats (list, comma-separated string, etc.)"""
+        if isinstance(v, list):
+            return [float(x) for x in v if isinstance(x, (int, float)) and 0 < float(x) <= 1]
+        if isinstance(v, str):
+            # Handle JSON array string like "[0.6, 0.8]" or comma-separated "0.6,0.8"
+            v = v.strip().strip("'\"")
+            if v.startswith('[') and v.endswith(']'):
+                # JSON array format
+                import json
+                try:
+                    parts = json.loads(v)
+                    return [float(x) for x in parts if isinstance(x, (int, float)) and 0 < float(x) <= 1]
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            # Comma-separated format
+            parts = [x.strip() for x in v.split(',')]
+            return [float(x) for x in parts if x and 0 < float(x) <= 1]
+        if isinstance(v, (int, float)):
+            return [float(v)] if 0 < float(v) <= 1 else []
+        return []
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -241,6 +350,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
     
     @property
     def workspace_path(self) -> Path:
@@ -250,7 +360,10 @@ class Config(BaseSettings):
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
         from nanobot.providers.registry import PROVIDERS
-        model_lower = (model or self.agents.defaults.model).lower()
+        target_model = model
+        if not target_model and self.agents.defaults.models:
+            target_model = self.agents.defaults.models[0]
+        model_lower = (target_model or "").lower()
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:

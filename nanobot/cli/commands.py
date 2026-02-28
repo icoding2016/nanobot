@@ -284,25 +284,27 @@ def _make_provider(config: Config):
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
+    models = config.agents.defaults.models
+    primary_model = models[0] if models else "anthropic/claude-3.5-sonnet"
+    provider_name = config.get_provider_name(primary_model)
+    p = config.get_provider(primary_model)
 
     # OpenAI Codex (OAuth): don't route via LiteLLM; use the dedicated implementation.
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
+    if provider_name == "openai_codex" or primary_model.startswith("openai-codex/"):
+        return OpenAICodexProvider(default_model=primary_model)
 
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    if not primary_model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
     return LiteLLMProvider(
         api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
+        api_base=config.get_api_base(primary_model),
+        default_models=models,
+        routing_strategy=config.agents.defaults.routing_strategy,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
     )
@@ -336,6 +338,28 @@ def gateway(
     
     config = load_config()
     bus = MessageBus()
+    
+    # Budget manager initialization (optional feature)
+    # Note: Budget tracking requires nanobot.budget module to be installed
+    budget_mgr = None
+    try:
+        from nanobot.budget.manager import init_budget_manager
+        
+        def send_budget_alert(msg: str, ratio: float):
+            """Send budget alert via enabled channels (synchronous)."""
+            alert_text = f"⚠️ Budget Alert: {msg} ({int(ratio * 100)}% used)"
+            console.print(f"[yellow]{alert_text}[/yellow]")
+        
+        budget_mgr = init_budget_manager(
+            monthly_usd=config.budget.monthly_usd,
+            monthly_calls=config.budget.monthly_calls,
+            alert_thresholds=config.budget.alert_thresholds,
+            on_alert=send_budget_alert,
+        )
+    except ImportError:
+        # Budget module not available, skip initialization
+        pass
+    
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
     
@@ -348,7 +372,7 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=None,  # Use provider default
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -359,6 +383,8 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        agent_profiles=config.agents.profiles,
+        orchestrator_rules=config.agents.defaults.orchestrator_rules,
     )
     
     # Set cron callback (needs agent)
@@ -460,7 +486,7 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=None,  # Use provider default
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -469,6 +495,8 @@ def agent(
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        agent_profiles=config.agents.profiles,
+        orchestrator_rules=config.agents.defaults.orchestrator_rules,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -879,7 +907,7 @@ def status():
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
 
-        console.print(f"Model: {config.agents.defaults.model}")
+        console.print(f"Models: {', '.join(config.agents.defaults.models)}")
         
         # Check API keys from registry
         for spec in PROVIDERS:

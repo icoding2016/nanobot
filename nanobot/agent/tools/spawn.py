@@ -35,7 +35,7 @@ class SpawnTool(Tool):
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done."
+            "You can specify a 'profile' (e.g., 'developer', 'researcher') to select the appropriate specialist."
         )
     
     @property
@@ -51,15 +51,20 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
                 },
+                "profile": {
+                    "type": "string",
+                    "description": "The profile of the subagent to spawn (e.g., 'developer', 'researcher', 'gemini-expert')",
+                },
             },
             "required": ["task"],
         }
     
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, task: str, label: str | None = None, profile: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
             label=label,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
+            profile=profile,
         )

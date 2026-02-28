@@ -11,6 +11,12 @@ from litellm import acompletion
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
+# Budget tracking
+try:
+    from nanobot.budget.manager import get_budget_manager
+except ImportError:
+    get_budget_manager = lambda: None  # Budget manager not available
+
 
 class LiteLLMProvider(LLMProvider):
     """
@@ -25,12 +31,15 @@ class LiteLLMProvider(LLMProvider):
         self, 
         api_key: str | None = None, 
         api_base: str | None = None,
-        default_model: str = "anthropic/claude-opus-4-5",
+        default_models: list[str] | None = None,
+        routing_strategy: str = "fallback",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
     ):
         super().__init__(api_key, api_base)
-        self.default_model = default_model
+        self.default_models = default_models or ["anthropic/claude-3.5-sonnet"]
+        self.primary_model = self.default_models[0]
+        self.routing_strategy = routing_strategy
         self.extra_headers = extra_headers or {}
         
         # Detect gateway / local deployment.
@@ -40,7 +49,7 @@ class LiteLLMProvider(LLMProvider):
         
         # Configure environment variables
         if api_key:
-            self._setup_env(api_key, api_base, default_model)
+            self._setup_env(api_key, api_base, self.primary_model)
         
         if api_base:
             litellm.api_base = api_base
@@ -107,7 +116,7 @@ class LiteLLMProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
+        models: list[str] | str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
@@ -117,28 +126,39 @@ class LiteLLMProvider(LLMProvider):
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions in OpenAI format.
-            model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
+            models: Model list (for fallbacks) or string identifier.
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
         
         Returns:
             LLMResponse with content and/or tool calls.
         """
-        model = self._resolve_model(model or self.default_model)
+        if models is None:
+            models_list = self.default_models
+        elif isinstance(models, str):
+            models_list = [models]
+        else:
+            models_list = models
+            
+        primary = self._resolve_model(models_list[0])
+        fallbacks = [self._resolve_model(m) for m in models_list[1:]] if len(models_list) > 1 else None
         
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
         
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": primary,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
         
+        if fallbacks:
+            kwargs["fallbacks"] = [{"model": f} for f in fallbacks]
+            
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
+        self._apply_model_overrides(primary, kwargs)
         
         # Pass api_key directly — more reliable than env vars alone
         if self.api_key:
@@ -186,12 +206,23 @@ class LiteLLMProvider(LLMProvider):
                 ))
         
         usage = {}
+        cost = 0.0
         if hasattr(response, "usage") and response.usage:
             usage = {
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
+            # Calculate cost using LiteLLM's cost calculation
+            try:
+                cost = litellm.completion_cost(completion_response=response)
+            except Exception:
+                cost = 0.0  # Cost calculation failed, continue without it
+        
+        # Record usage in budget manager
+        budget_mgr = get_budget_manager()
+        if budget_mgr:
+            budget_mgr.record_call(cost)
         
         reasoning_content = getattr(message, "reasoning_content", None)
         
@@ -204,5 +235,5 @@ class LiteLLMProvider(LLMProvider):
         )
     
     def get_default_model(self) -> str:
-        """Get the default model."""
-        return self.default_model
+        """Get the primary default model."""
+        return self.primary_model

@@ -31,7 +31,7 @@ class SubagentManager:
         provider: LLMProvider,
         workspace: Path,
         bus: MessageBus,
-        model: str | None = None,
+        models: list[str] | str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
@@ -42,7 +42,7 @@ class SubagentManager:
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
-        self.model = model or provider.get_default_model()
+        self.models = models
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
@@ -133,7 +133,7 @@ class SubagentManager:
                 response = await self.provider.chat(
                     messages=messages,
                     tools=tools.get_definitions(),
-                    model=self.model,
+                    models=self.models,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
