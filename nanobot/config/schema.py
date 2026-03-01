@@ -274,6 +274,34 @@ class MCPServerConfig(BaseModel):
     url: str = ""  # HTTP: streamable HTTP endpoint URL
 
 
+class SupervisorConfig(BaseModel):
+    """SubAgent supervisor configuration for health monitoring and intervention."""
+    enabled: bool = True
+    check_interval_seconds: int = 60  # How often to check SubAgent health
+    
+    # Heartbeat timeouts by profile (in seconds)
+    # Default: 15 minutes for most profiles
+    heartbeat_timeouts: dict[str, int] = Field(
+        default_factory=lambda: {
+            "debugger": 600,      # 10 minutes
+            "developer": 900,     # 15 minutes
+            "designer": 1800,     # 30 minutes
+            "researcher": 1800,   # 30 minutes
+            "assistant": 900,     # 15 minutes
+        }
+    )
+    
+    # Default timeout for unknown profiles
+    default_heartbeat_timeout: int = 900  # 15 minutes
+    
+    # Escalation: time to wait after L1 intervention before L2
+    escalation_timeout_seconds: int = 300  # 5 minutes
+    
+    # Enable/disable intervention levels
+    enable_l1_intervention: bool = True  # Hint injection
+    enable_l2_intervention: bool = True  # Model switch
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
