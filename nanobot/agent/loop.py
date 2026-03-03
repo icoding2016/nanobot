@@ -38,6 +38,21 @@ DEFAULT_HEARTBEAT_TIMEOUTS = {
 DEFAULT_HEARTBEAT_TIMEOUT = 900  # 15 minutes default
 
 
+def _extract_command(content: str) -> tuple[str | None, str]:
+    """
+    Extract command prefix and rest from content.
+    
+    Supports both '/' (Telegram native) and '!' (cross-platform) prefixes.
+    
+    Returns:
+        Tuple of (prefix, rest) where prefix is '/' or '!' or None.
+    """
+    content = content.strip()
+    if content.startswith(('/', '!')):
+        return content[0], content[1:]
+    return None, content
+
+
 class InterventionTracker:
     """
     Tracks intervention history for SubAgent tasks.
@@ -517,10 +532,12 @@ class AgentLoop:
         base_key = session_key or msg.session_key
         base_session = self.sessions.get_or_create(base_key)
         
-        # Handle slash commands
+        # Handle commands (support both / and ! prefixes)
         raw_content = msg.content.strip()
-        cmd = raw_content.lower()
-        if cmd == "/new":
+        prefix, rest = _extract_command(raw_content)
+        cmd = rest.lower() if prefix else ""
+        
+        if prefix and cmd == "new":
             current_topic = base_session.metadata.get("active_topic")
             if current_topic:
                 from datetime import datetime
@@ -543,11 +560,12 @@ class AgentLoop:
             asyncio.create_task(_consolidate_and_cleanup())
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started. Memory consolidation in progress.")
-        if cmd == "/help":
+        
+        if prefix and cmd == "help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/topic <name> — Switch to a named topic\n/status — Show status\n/help — Show available commands\n\nRouting:\n@<agent> <task> — Send task to a specific agent\n/<cmd> <task> — Execute a configured shortcut command")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/topic <name> — Switch to a named topic\n/status — Show status\n/help — Show available commands\n\nRouting:\n@<agent> <task> — Send task to a specific agent\n/<cmd> <task> — Execute a configured shortcut command\n\nNote: Both / and ! prefixes work (e.g., /status or !status)")
 
-        if cmd == "/status":
+        if prefix and cmd == "status":
             orchestrator_models = self._get_orchestrator_models()
             profiles = []
             for name, profile in self.agent_profiles.items():
@@ -619,8 +637,9 @@ class AgentLoop:
             content = "\n".join(content_lines)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
-        if cmd.startswith("/topic"):
-            parts = raw_content.split(maxsplit=1)
+        if prefix and cmd.startswith("topic"):
+            # Extract topic name from the command (handle both /topic and !topic)
+            parts = rest.split(maxsplit=1)
             topics = self._list_topics(base_key)
             if len(parts) < 2 or not parts[1].strip():
                 if not topics:
