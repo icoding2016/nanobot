@@ -3,6 +3,7 @@
 import html
 import json
 import os
+import random
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -14,6 +15,15 @@ from nanobot.agent.tools.base import Tool
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
 MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
+
+# Public SearXNG instances (fallback list)
+SEARXNG_INSTANCES = [
+    "https://searx.be",
+    "https://search.bus-hit.me",
+    "https://search.rowie.at",
+    "https://searx.fmac.xyz",
+    "https://search.sapti.me",
+]
 
 
 def _strip_tags(text: str) -> str:
@@ -43,11 +53,11 @@ def _validate_url(url: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+class SearXNGSearchTool(Tool):
+    """Search the web using SearXNG (free, no API key required)."""
     
     name = "web_search"
-    description = "Search the web. Returns titles, URLs, and snippets."
+    description = "Search the web using SearXNG. Returns titles, URLs, and snippets. No API key required."
     parameters = {
         "type": "object",
         "properties": {
@@ -57,14 +67,90 @@ class WebSearchTool(Tool):
         "required": ["query"]
     }
     
-    def __init__(self, api_key: str | None = None, max_results: int = 5):
-        self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
+    def __init__(self, instance_url: str | None = None, max_results: int = 5):
+        self.instance_url = instance_url or os.environ.get("SEARXNG_URL", "")
         self.max_results = max_results
+        # Shuffle instances for load balancing if using default list
+        self._instances = SEARXNG_INSTANCES.copy()
+        random.shuffle(self._instances)
+    
+    async def _search_instance(self, client: httpx.AsyncClient, instance: str, query: str, n: int) -> list[dict]:
+        """Search a single SearXNG instance."""
+        try:
+            r = await client.get(
+                f"{instance}/search",
+                params={"q": query, "format": "json", "engines": "google,bing,duckduckgo"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=15.0
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data.get("results", [])[:n]
+        except Exception:
+            return []
     
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
+        n = min(max(count or self.max_results, 1), 10)
         
+        async with httpx.AsyncClient() as client:
+            results = []
+            
+            # Try configured instance first
+            if self.instance_url:
+                results = await self._search_instance(client, self.instance_url, query, n)
+            
+            # Fallback to public instances
+            if not results:
+                for instance in self._instances[:3]:  # Try up to 3 instances
+                    results = await self._search_instance(client, instance, query, n)
+                    if results:
+                        break
+            
+            if not results:
+                return f"No results for: {query}"
+            
+            lines = [f"Results for: {query}\n"]
+            for i, item in enumerate(results[:n], 1):
+                lines.append(f"{i}. {item.get('title', 'No title')}\n   {item.get('url', '')}")
+                if content := item.get("content"):
+                    lines.append(f"   {content[:200]}")
+            return "\n".join(lines)
+
+
+class WebSearchTool(Tool):
+    """Search the web. Uses SearXNG (free) or Brave Search API (if configured)."""
+    
+    name = "web_search"
+    description = "Search the web. Returns titles, URLs, and snippets. Uses SearXNG by default (no API key needed)."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "count": {"type": "integer", "description": "Results (1-10)", "minimum": 1, "maximum": 10}
+        },
+        "required": ["query"]
+    }
+    
+    def __init__(self, api_key: str | None = None, max_results: int = 5, searxng_url: str | None = None):
+        self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
+        self.searxng_url = searxng_url or os.environ.get("SEARXNG_URL", "")
+        self.max_results = max_results
+        # SearXNG fallback instances
+        self._searxng = SearXNGSearchTool(self.searxng_url, max_results)
+    
+    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+        # Prefer SearXNG (free, no API key needed)
+        # Only use Brave if explicitly configured and SearXNG fails
+        try:
+            return await self._searxng.execute(query, count, **kwargs)
+        except Exception as e:
+            # Fallback to Brave API if configured
+            if self.api_key:
+                return await self._brave_search(query, count)
+            return f"Error: Search failed - {e}"
+    
+    async def _brave_search(self, query: str, count: int | None = None) -> str:
+        """Fallback to Brave Search API."""
         try:
             n = min(max(count or self.max_results, 1), 10)
             async with httpx.AsyncClient() as client:
