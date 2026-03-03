@@ -563,7 +563,7 @@ class AgentLoop:
         
         if prefix and cmd == "help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/topic <name> — Switch to a named topic\n/status — Show status\n/help — Show available commands\n\nRouting:\n@<agent> <task> — Send task to a specific agent\n/<cmd> <task> — Execute a configured shortcut command\n\nNote: Both / and ! prefixes work (e.g., /status or !status)")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/topic <name> — Switch to a named topic\n/status — Show status\n/help — Show available commands\n\nRouting:\n@<agent> <task> — Send task to a specific agent\n  Examples: @developer fix the bug, @designer design API\n\nNote: Both / and ! prefixes work (e.g., /status or !status)")
 
         if prefix and cmd == "status":
             orchestrator_models = self._get_orchestrator_models()
