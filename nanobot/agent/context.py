@@ -94,7 +94,8 @@ Skills with available="false" need dependencies installed first - you can try in
             profiles_text = "\n\n## Available Subagent Profiles\nYou can spawn subagents with specific roles/models using the 'spawn' tool. Use these profiles to choose the right model for the task:\n"
             for name, profile in self.agent_profiles.items():
                 desc = f" - {profile.description}" if profile.description else ""
-                profiles_text += f"- **{name}**: {profile.model}{desc}\n"
+                models_str = ", ".join(profile.models) if profile.models else "(default)"
+                profiles_text += f"- **{name}**: {models_str}{desc}\n"
         
         return f"""# nanobot 🐈
 
