@@ -272,6 +272,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # Bailian (阿里云百炼): OpenAI-compatible API for various Chinese models.
+    # Uses openai/ prefix with custom api_base (OpenAI-compatible).
+    ProviderSpec(
+        name="bailian",
+        keywords=("bailian",),
+        env_key="ALI_CODING_PLAN_API_KEY",
+        display_name="Bailian",
+        litellm_prefix="openai",            # OpenAI-compatible API
+        skip_prefixes=("openai/", "bailian/"),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="dashscope",
+        default_api_base="https://coding.dashscope.aliyuncs.com/v1",
+        strip_model_prefix=True,            # bailian/glm-5 → glm-5 → openai/glm-5
+        model_overrides=(),
+    ),
+
     # Moonshot: Kimi models, needs "moonshot/" prefix.
     # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
     # Kimi K2.5 API enforces temperature >= 1.0.
