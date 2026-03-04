@@ -2,15 +2,21 @@
 
 import html
 import json
+import logging
 import os
 import random
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
 from nanobot.agent.tools.base import Tool
+
+# Setup logger
+logger = logging.getLogger("nanobot.web_tools")
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -24,6 +30,47 @@ SEARXNG_INSTANCES = [
     "https://searx.fmac.xyz",
     "https://search.sapti.me",
 ]
+
+# Search usage tracking file
+USAGE_FILE = Path.home() / ".nanobot" / "search_usage.json"
+
+
+def _load_usage() -> dict:
+    """Load search usage data from file."""
+    if USAGE_FILE.exists():
+        try:
+            with open(USAGE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"brave": {"month": "", "count": 0}}
+
+
+def _save_usage(data: dict) -> None:
+    """Save search usage data to file."""
+    USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(USAGE_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def _get_brave_usage_this_month() -> int:
+    """Get Brave search count for current month."""
+    data = _load_usage()
+    current_month = datetime.now().strftime("%Y-%m")
+    if data.get("brave", {}).get("month") == current_month:
+        return data["brave"]["count"]
+    return 0
+
+
+def _increment_brave_usage() -> None:
+    """Increment Brave search count for current month."""
+    data = _load_usage()
+    current_month = datetime.now().strftime("%Y-%m")
+    if data.get("brave", {}).get("month") != current_month:
+        data["brave"] = {"month": current_month, "count": 0}
+    data["brave"]["count"] += 1
+    _save_usage(data)
+    logger.info(f"Brave search usage: {data['brave']['count']} this month")
 
 
 def _strip_tags(text: str) -> str:
@@ -118,10 +165,10 @@ class SearXNGSearchTool(Tool):
 
 
 class WebSearchTool(Tool):
-    """Search the web. Uses SearXNG (free) or Brave Search API (if configured)."""
+    """Search the web. Routes to Brave Search (if configured with quota) or SearXNG (free fallback)."""
     
     name = "web_search"
-    description = "Search the web. Returns titles, URLs, and snippets. Uses SearXNG by default (no API key needed)."
+    description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {
         "type": "object",
         "properties": {
@@ -131,49 +178,65 @@ class WebSearchTool(Tool):
         "required": ["query"]
     }
     
-    def __init__(self, api_key: str | None = None, max_results: int = 5, searxng_url: str | None = None):
+    def __init__(self, api_key: str | None = None, max_results: int = 5, searxng_url: str | None = None,
+                 brave_monthly_limit: int = 2000):
         self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
         self.searxng_url = searxng_url or os.environ.get("SEARXNG_URL", "")
         self.max_results = max_results
-        # SearXNG fallback instances
+        self.brave_monthly_limit = int(os.environ.get("BRAVE_MONTHLY_LIMIT", brave_monthly_limit))
         self._searxng = SearXNGSearchTool(self.searxng_url, max_results)
     
+    def _can_use_brave(self) -> bool:
+        """Check if Brave Search can be used (has key and quota available)."""
+        if not self.api_key:
+            return False
+        current_usage = _get_brave_usage_this_month()
+        return current_usage < self.brave_monthly_limit
+    
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        # Prefer SearXNG (free, no API key needed)
-        # Only use Brave if explicitly configured and SearXNG fails
+        n = min(max(count or self.max_results, 1), 10)
+        
+        # Decision: Brave (if available with quota) or SearXNG
+        if self._can_use_brave():
+            logger.info(f"[web_search] Using Brave Search (quota: {_get_brave_usage_this_month()}/{self.brave_monthly_limit})")
+            try:
+                result = await self._brave_search(query, n)
+                _increment_brave_usage()
+                return result
+            except Exception as e:
+                logger.warning(f"[web_search] Brave failed: {e}, falling back to SearXNG")
+                # Fall through to SearXNG
+        else:
+            reason = "no API key" if not self.api_key else f"quota exceeded ({_get_brave_usage_this_month()}/{self.brave_monthly_limit})"
+            logger.info(f"[web_search] Using SearXNG (Brave: {reason})")
+        
+        # Use SearXNG
         try:
             return await self._searxng.execute(query, count, **kwargs)
         except Exception as e:
-            # Fallback to Brave API if configured
-            if self.api_key:
-                return await self._brave_search(query, count)
             return f"Error: Search failed - {e}"
     
-    async def _brave_search(self, query: str, count: int | None = None) -> str:
-        """Fallback to Brave Search API."""
-        try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-            
-            results = r.json().get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-            
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results[:n], 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error: {e}"
+    async def _brave_search(self, query: str, n: int) -> str:
+        """Execute search via Brave Search API."""
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": n},
+                headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                timeout=10.0
+            )
+            r.raise_for_status()
+        
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return f"No results for: {query}"
+        
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:n], 1):
+            lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+            if desc := item.get("description"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
 
 
 class WebFetchTool(Tool):
