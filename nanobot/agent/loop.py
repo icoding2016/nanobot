@@ -962,7 +962,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         return content + "\n\n" + "\n\n".join(references)
 
     def _coord_log_path(self) -> Path:
-        return self.workspace / "task" / "coord.md"
+        return self.workspace / "tasks" / "coord.md"
 
     def _record_coord_event(self, base_key: str, event: str, topic: str | None, reason: str | None) -> None:
         path = self._coord_log_path()
@@ -1016,11 +1016,11 @@ Respond with ONLY valid JSON, no markdown fences."""
         return stem
 
     def _task_candidates(self) -> list[dict[str, Any]]:
-        task_dir = self.workspace / "task"
-        if not task_dir.exists():
+        tasks_dir = self.workspace / "tasks"
+        if not tasks_dir.exists():
             return []
         items = []
-        for path in task_dir.glob("task-*.md"):
+        for path in tasks_dir.glob("task-*.md"):
             stem = path.stem
             title = stem[5:] if stem.startswith("task-") else stem
             title = self._strip_task_date(title)

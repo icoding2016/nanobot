@@ -214,7 +214,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 """,
         "SOUL.md": """# Soul
 
-I am nanobot, a lightweight AI assistant.
+I am a super powerful lightweight AI assistant.
 
 ## Personality
 

@@ -10,14 +10,14 @@ import litellm
 
 def ensure_workspace_structure(workspace: Path) -> None:
     (workspace / "diary").mkdir(parents=True, exist_ok=True)
-    task_dir = workspace / "task"
-    task_dir.mkdir(parents=True, exist_ok=True)
+    tasks_dir = workspace / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
     data_dir = workspace / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    mission = task_dir / "mission.md"
+    mission = tasks_dir / "mission.md"
     if not mission.exists():
         mission.write_text("# Missions\n\n", encoding="utf-8")
-    coord_log = task_dir / "coord.md"
+    coord_log = tasks_dir / "coord.md"
     if not coord_log.exists():
         coord_log.write_text("# Coordination Log\n\n", encoding="utf-8")
     openrouter_dest = data_dir / "openrouter_models.json"
@@ -64,7 +64,7 @@ def ensure_system_jobs(cron_service, workspace: Path) -> None:
             name="daily-task-review",
             schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
             message=(
-                "Review workspace/task/mission.md and task-*.md files. "
+                "Review workspace/tasks/mission.md and task-*.md files. "
                 "Summarize progress, update statuses, and decide next actions. "
                 "If a task is stalled, note blockers."
             ),
