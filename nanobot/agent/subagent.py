@@ -1,4 +1,4 @@
-"""Subagent manager for background task execution."""
+﻿"""Subagent manager for background task execution."""
 
 import asyncio
 import json
@@ -19,6 +19,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.agent.tools.signal import SignalTool
 from nanobot.agent.memory import MemoryStore
 
 
@@ -112,6 +113,19 @@ class SubagentManager:
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._running_meta: dict[str, dict[str, Any]] = {}
         self._activity_logs: dict[str, ActivityLog] = {}
+        self._task_mailboxes: dict[str, list[dict]] = {}
+        self.supervisor = None
+
+    def set_supervisor(self, supervisor: Any) -> None:
+        """Set the supervisor instance."""
+        self.supervisor = supervisor
+
+    def post_event(self, task_id: str, event: dict) -> None:
+        """Post a control event to a subagent task."""
+        if task_id not in self._task_mailboxes:
+            self._task_mailboxes[task_id] = []
+        self._task_mailboxes[task_id].append(event)
+        logger.info(f"Posted event to task [{task_id}]: {event.get('type')}")
     
     async def spawn(
         self,
@@ -165,12 +179,14 @@ class SubagentManager:
         
         # Create activity log for heartbeat monitoring
         self._activity_logs[task_id] = ActivityLog(task_id)
+        self._task_mailboxes[task_id] = []
         
         # Cleanup when done
         def _cleanup(_: asyncio.Task[None]) -> None:
             self._running_tasks.pop(task_id, None)
             self._running_meta.pop(task_id, None)
             self._activity_logs.pop(task_id, None)
+            self._task_mailboxes.pop(task_id, None)
         bg_task.add_done_callback(_cleanup)
         
         logger.info(f"Spawned subagent [{task_id}]: {display_label}")
@@ -188,7 +204,7 @@ class SubagentManager:
         """Execute the subagent task and announce the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         
-        # Setup Blackboard — boards/<agent>/<task_id>-<label>/board.md
+        # Setup Blackboard  boards/<agent>/<task_id>-<label>/board.md
         safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:30]
         agent_dir_name = profile_name or "generic"
         task_dir = self.workspace / "boards" / agent_dir_name / f"{task_id}-{safe_label}"
@@ -230,6 +246,9 @@ In Progress
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
             
+            # Register SignalTool
+            tools.register(SignalTool(self.supervisor, task_id=task_id))
+            
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task, board_rel)
             messages: list[dict[str, Any]] = [
@@ -248,6 +267,25 @@ In Progress
             while iteration < max_iterations:
                 iteration += 1
                 
+                # Consume Mailbox Events
+                if task_id in self._task_mailboxes and self._task_mailboxes[task_id]:
+                    events = self._task_mailboxes[task_id]
+                    self._task_mailboxes[task_id] = [] # Clear mailbox
+                    for event in events:
+                        event_type = event.get("type")
+                        if event_type == "inject_hint":
+                            content = event.get("content", "")
+                            logger.info(f"Subagent [{task_id}] consuming hint: {content[:50]}...")
+                            messages.append({"role": "system", "content": content})
+                        elif event_type == "terminate":
+                            logger.warning(f"Subagent [{task_id}] terminated by supervisor")
+                            raise Exception("Task terminated by supervisor")
+                        elif event_type == "rescue_switch":
+                            # TODO: Implement model switching
+                            # For now, just log and maybe inject a strong hint
+                            logger.warning(f"Subagent [{task_id}] rescue switch requested (not fully implemented)")
+                            messages.append({"role": "system", "content": "[System] You are struggling. Please summarize your progress and switch approach."})
+
                 # Record iteration in activity log
                 if activity_log:
                     activity_log.iteration = iteration
@@ -363,8 +401,8 @@ Return ONLY valid JSON with keys "memory_update" (string) and "knowledge_items" 
             )
             
             text = (response.content or "").strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            if text.startswith("`"):
+                text = text.split("\n", 1)[-1].rsplit("`", 1)[0].strip()
             
             data = json_repair.loads(text)
             
@@ -456,13 +494,13 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 You are a subagent spawned by the main agent to complete a specific task.
 
 ## Context & Blackboard
-You have been assigned a specific Project Board file: `{board_rel}`.
-1. READ this file immediately using `read_file` to understand your task and history.
-2. UPDATE this file frequently with your findings, plan, and progress using `edit_file`.
-3. This board is your primary memory — write your progress, sub-tasks, and findings here.
+You have been assigned a specific Project Board file: {board_rel}.
+1. READ this file immediately using ead_file to understand your task and history.
+2. UPDATE this file frequently with your findings, plan, and progress using edit_file.
+3. This board is your primary memory  write your progress, sub-tasks, and findings here.
 
 ## Rules
-1. Stay focused — complete only the assigned task, nothing else
+1. Stay focused  complete only the assigned task, nothing else
 2. Your final response will be reported back to the main agent
 3. Do not initiate conversations or take on side tasks
 4. Be concise but informative in your findings
@@ -483,7 +521,7 @@ Your workspace is at: {self.workspace}
 Skills are available at: {self.workspace}/skills/ (read SKILL.md files as needed)
 
 When you have completed the task, provide a clear summary of your findings or actions."""
-    
+
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
@@ -492,14 +530,14 @@ When you have completed the task, provide a clear summary of your findings or ac
         items = list(self._running_meta.values())
         items.sort(key=lambda x: x.get("started_at", ""), reverse=True)
         return items
-    
+
     def get_task_status(self, task_id: str) -> dict[str, Any] | None:
         """
         Get detailed status of a running task for monitoring.
-        
+
         Args:
             task_id: The task ID to query
-            
+
         Returns:
             Task status dict with heartbeat info, or None if task not found
         """
@@ -508,7 +546,7 @@ When you have completed the task, provide a clear summary of your findings or ac
             return None
         
         activity_log = self._activity_logs.get(task_id)
-        
+
         status = {
             **meta,
             "idle_seconds": activity_log.get_idle_seconds() if activity_log else 0,
@@ -516,13 +554,13 @@ When you have completed the task, provide a clear summary of your findings or ac
             "event_count": len(activity_log.events) if activity_log else 0,
             "recent_events": activity_log.get_recent_events() if activity_log else [],
         }
-        
+
         return status
-    
+
     def get_all_task_statuses(self) -> list[dict[str, Any]]:
         """
         Get status of all running tasks.
-        
+
         Returns:
             List of task status dicts
         """

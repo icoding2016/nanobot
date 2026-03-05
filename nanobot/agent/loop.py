@@ -1,4 +1,4 @@
-"""Agent loop: the core processing engine."""
+﻿"""Agent loop: the core processing engine."""
 
 import asyncio
 from contextlib import AsyncExitStack
@@ -127,9 +127,6 @@ class AgentSupervisor:
         self.interventions = InterventionTracker()
         self._running = False
         self._task: asyncio.Task | None = None
-        
-        # Messages to inject into SubAgent loops (task_id -> message)
-        self._pending_injections: dict[str, str] = {}
     
     def start(self) -> None:
         """Start the monitoring loop."""
@@ -178,6 +175,16 @@ class AgentSupervisor:
             if idle_seconds > timeout:
                 await self._handle_stuck_task(task_id, status)
     
+    async def trigger_intervention(self, task_id: str, intervention_type: str, details: str) -> None:
+        """Trigger an intervention from an external signal (e.g. SubAgent)."""
+        logger.warning(f"Triggering intervention for task [{task_id}]: {intervention_type} - {details}")
+        status = self.subagents.get_task_status(task_id) or {"id": task_id}
+        
+        if intervention_type == "stuck":
+            await self._intervene_l1(task_id, status)
+        elif intervention_type == "need_help":
+            await self._intervene_l2(task_id, status)
+
     async def _handle_stuck_task(self, task_id: str, status: dict) -> None:
         """Handle a potentially stuck task."""
         idle_seconds = status.get("idle_seconds", 0)
@@ -199,9 +206,6 @@ class AgentSupervisor:
     async def _intervene_l1(self, task_id: str, status: dict) -> None:
         """
         L1 intervention: Inject a hint message into the SubAgent.
-        
-        This is a lightweight intervention that just adds a message
-        to prompt the SubAgent to continue or report status.
         """
         idle_seconds = int(status.get("idle_seconds", 0))
         label = status.get("label", "task")
@@ -215,29 +219,25 @@ If you're stuck, please:
 
 Please continue or report your status."""
         
-        # Queue the injection
-        self._pending_injections[task_id] = hint
+        # Post event to mailbox
+        self.subagents.post_event(task_id, {
+            "type": "inject_hint",
+            "content": hint
+        })
         self.interventions.record(task_id, 1, "hint_injection")
         
-        logger.info(f"L1 intervention: hint queued for task [{task_id}]")
+        logger.info(f"L1 intervention: hint sent to task [{task_id}]")
     
     async def _intervene_l2(self, task_id: str, status: dict) -> None:
         """
         L2 intervention: Model switch with handoff.
-        
-        This is a heavier intervention that requires the current model
-        to generate a handoff document and switches to a different model.
-        
-        Note: This requires integration with the SubAgent loop to:
-        1. Pause execution
-        2. Generate handoff
-        3. Switch model
-        4. Continue with new context
         """
-        # For now, log and mark as requiring manual intervention
-        # Full implementation would need deeper integration with _run_subagent
-        logger.warning(f"L2 intervention: model switch requested for task [{task_id}]")
+        # Post event to mailbox
+        self.subagents.post_event(task_id, {
+            "type": "rescue_switch"
+        })
         self.interventions.record(task_id, 2, "model_switch")
+        logger.warning(f"L2 intervention: model switch requested for task [{task_id}]")
         
         # Broadcast a system message about the stuck task
         from nanobot.bus.events import InboundMessage
@@ -250,10 +250,6 @@ Please continue or report your status."""
                     f"Profile: {status.get('profile', 'unknown')}"
         )
         await self.bus.publish_inbound(msg)
-    
-    def get_pending_injection(self, task_id: str) -> str | None:
-        """Get and clear a pending injection for a task."""
-        return self._pending_injections.pop(task_id, None)
     
     def heartbeat_detected(self, task_id: str) -> None:
         """Called when a heartbeat is detected, marking intervention as successful."""
@@ -341,6 +337,8 @@ class AgentLoop:
             subagent_manager=self.subagents,
             bus=self.bus,
         )
+        # Connect supervisor to subagent manager
+        self.subagents.set_supervisor(self.supervisor)
         
         self._register_default_tools()
     
@@ -563,7 +561,7 @@ class AgentLoop:
         
         if prefix and cmd == "help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/topic <name> — Switch to a named topic\n/status — Show status\n/help — Show available commands\n\nRouting:\n@<agent> <task> — Send task to a specific agent\n  Examples: @developer fix the bug, @designer design API\n\nNote: Both / and ! prefixes work (e.g., /status or !status)")
+                                  content="🐈 Commands:\n/new — Start a new conversation\n/topic <name> — Switch to a named topic\n/status — Show status\n/help — Show available commands\n\nRouting:\n@<agent> <task> — Send task to a specific agent\n  Examples: @developer fix the bug, @designer design API\n\nNote: Both / and ! prefixes work (e.g., /status or !status)")
 
         if prefix and cmd == "status":
             orchestrator_models = self._get_orchestrator_models()
@@ -800,8 +798,19 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
-        session_key = f"{origin_channel}:{origin_chat_id}"
-        session = self.sessions.get_or_create(session_key)
+        # Determine session key (base)
+        base_key = f"{origin_channel}:{origin_chat_id}"
+        base_session = self.sessions.get_or_create(base_key)
+        
+        # Check active topic
+        active_topic = base_session.metadata.get("active_topic")
+        if active_topic:
+            session_key = f"{base_key}:{active_topic}"
+            session = self.sessions.get_or_create(session_key)
+            logger.info(f"Routing system message to topic session: {active_topic}")
+        else:
+            session = base_session
+            
         self._set_tool_context(origin_channel, origin_chat_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
@@ -858,46 +867,62 @@ class AgentLoop:
             if not m.get("content"):
                 continue
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
-        conversation = "\n".join(lines)
-        word_count = len(conversation.split())
-        max_words = max(1000, min(4000, int(word_count * 0.25))) if word_count else 1000
-        current_memory = memory.read_long_term()
+            lines.append(f"{m['role']}: {m['content']}{tools}")
 
-        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
+        if not lines:
+            return
 
-1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+        text_to_process = "\n".join(lines)
+        memory.append_history(text_to_process)
 
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged. Keep this under {max_words} words.
+        # Update long-term memory using LLM
+        prompt = f"""You are a Memory Consolidation Agent.
+Analyze the conversation snippet below and update the Long-term Memory.
 
-## Current Long-term Memory
-{current_memory or "(empty)"}
+## Conversation Snippet
+{text_to_process}
 
-## Conversation to Process
-{conversation}
+## Instructions
+1. Extract key facts, user preferences, technical decisions, and project context.
+2. Return a JSON object with:
+   - "history_entry": A brief summary string of this conversation segment.
+   - "memory_update": The updated markdown content for MEMORY.md.
 
-Respond with ONLY valid JSON, no markdown fences."""
+## Current Memory
+(Not provided here, assume you are generating an update to be merged)
 
+Return ONLY valid JSON.
+"""
         try:
+            current_memory = memory.read_long_term()
+            # If we had the current memory, we could pass it. For now, we trust the agent to generate a delta or full update?
+            # Actually, the prompt says "The updated markdown content". This implies rewriting.
+            # To be safe, we should provide current memory.
+            prompt = prompt.replace("(Not provided here, assume you are generating an update to be merged)", current_memory)
+            
+            # Limit prompt size if needed
+            if len(prompt) > 10000:
+                prompt = prompt[:10000] + "...(truncated)"
+
             response = await self.provider.chat(
                 messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
+                    {"role": "system", "content": "You are a Memory Consolidation Agent. Respond only with valid JSON."},
                     {"role": "user", "content": prompt},
                 ],
                 models=self.models,
             )
-            
+
             # Check budget thresholds after LLM call
             await self._check_budget_thresholds()
             text = (response.content or "").strip()
             if not text:
                 logger.warning("Memory consolidation: LLM returned empty response, skipping")
                 return
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            if text.startswith("`"):
+                text = text.split("\n", 1)[-1].rsplit("`", 1)[0].strip()
             result = json_repair.loads(text)
             if not isinstance(result, dict):
-                logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
+                logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")   
                 return
 
             if entry := result.get("history_entry"):
@@ -942,10 +967,13 @@ Respond with ONLY valid JSON, no markdown fences."""
                         continue
                 else:
                     rel = Path(target)
-                    if rel.suffix:
-                        path = (self.workspace / "boards" / rel).resolve()
+                    if str(rel).startswith("boards/"):
+                         path = (self.workspace / rel).resolve()
                     else:
-                        path = (self.workspace / "boards" / rel / "board.md").resolve()
+                        if rel.suffix:
+                            path = (self.workspace / "boards" / rel).resolve()
+                        else:
+                            path = (self.workspace / "boards" / rel / "board.md").resolve()
 
             if not str(path).startswith(str(self.workspace.resolve())):
                 continue
@@ -992,7 +1020,11 @@ Respond with ONLY valid JSON, no markdown fences."""
         return f"boards/orchestrator/{safe_topic}/board.md"
 
     def _attach_topic_board_reference(self, content: str, board_rel: str) -> str:
-        token = f"#board:{Path(board_rel).parent.as_posix()}"
+        # Generate token relative to workspace (usually starts with boards/)
+        # But for token usage we want it concise if possible?
+        # The parser handles "boards/..." or "orchestrator/..."?
+        # Let's stick to full relative path "boards/orchestrator/..."
+        token = f"#board:{board_rel}"
         if token in content:
             return content
         board_path = (self.workspace / board_rel).resolve()
@@ -1066,7 +1098,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         title, path = self._match_topic_from_tasks(content)
         if title:
             return title, "task_match", path
-        if "```" in content or len(content) >= 80:
+        if "`" in content or len(content) >= 80:
             snippet = content.strip().splitlines()[0][:50]
             candidate = "".join(c if c.isalnum() or c in "-_" else "_" for c in snippet).strip("_")
             if candidate:
@@ -1152,7 +1184,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             return "no cost data", [], ""
 
         model_lines = []
-        for name, stats in sorted(models.items(), key=lambda x: float(x[1].get("total_cost", 0.0)), reverse=True):
+        for name, stats in sorted(models.items(), key=lambda x: float(x[1].get("total_cost", 0.0)), reverse=True):    
             in_tokens = int(stats.get("prompt_tokens", 0))
             out_tokens = int(stats.get("completion_tokens", 0))
             total_tokens_item = int(stats.get("total_tokens", 0))
@@ -1170,7 +1202,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                 f"price_in={price_in_text}, price_out={price_out_text}"
             )
 
-        budget_limit = budget.get("monthly_usd") if isinstance(budget.get("monthly_usd"), (int, float)) else None
+        budget_limit = budget.get("monthly_usd") if isinstance(budget.get("monthly_usd"), (int, float)) else None     
         if isinstance(budget_limit, (int, float)) and budget_limit > 0:
             percent = (total_cost / float(budget_limit) * 100) if budget_limit else 0.0
             status = " exceeded" if total_cost > float(budget_limit) else ""
@@ -1183,25 +1215,25 @@ Respond with ONLY valid JSON, no markdown fences."""
     async def _check_budget_thresholds(self) -> None:
         """Check budget usage and send alerts when thresholds are crossed."""
         from nanobot.config.schema import Config
-        
+
         # Load config to get budget settings
         try:
             config = Config()
             budget_config = config.budget
             monthly_budget = budget_config.monthly_usd
             alert_thresholds = budget_config.alert_thresholds
-            
+
             if not monthly_budget or monthly_budget <= 0:
                 return
-                
+
             if not alert_thresholds:
                 return
         except Exception:
             return
-        
+
         # Get current cost data
         cost_total, cost_models, cost_budget = self._read_cost_summary()
-        
+
         # Extract total cost from cost_total string (format: "tokens=X, cost=Y.ZZZZZZ")
         total_cost = 0.0
         if cost_total and "cost=" in cost_total:
@@ -1209,46 +1241,46 @@ Respond with ONLY valid JSON, no markdown fences."""
                 total_cost = float(cost_total.split("cost=")[1])
             except (IndexError, ValueError):
                 return
-        
+
         if total_cost <= 0:
             return
-            
+
         # Calculate usage percentage
         usage_percentage = total_cost / monthly_budget
-        
+
         # Check each threshold
         for threshold in alert_thresholds:
             if threshold <= 0 or threshold > 1:
                 continue
-                
+
             # Check if this threshold has been crossed and not yet alerted
             if usage_percentage >= threshold and threshold not in self._budget_alerts_sent:
                 # Mark this threshold as alerted
                 self._budget_alerts_sent.add(threshold)
-                
+
                 # Send alert to all enabled channels
                 await self._broadcast_budget_alert(threshold, usage_percentage, total_cost, monthly_budget)
-    
+
     async def _broadcast_budget_alert(self, threshold: float, usage: float, current_cost: float, budget: float) -> None:
         """Broadcast budget alert to all enabled channels."""
         from nanobot.config.schema import Config
-        
+
         try:
             config = Config()
-            
+
             # Build alert message
             percentage = usage * 100
             threshold_percentage = threshold * 100
-            
+
             alert_message = (
                 f"🚨 Budget Alert: {percentage:.1f}% of monthly budget used\n"
                 f"Current cost: ${current_cost:.2f} / ${budget:.2f}\n"
                 f"Threshold crossed: {threshold_percentage:.0f}%"
             )
-            
+
             # Get list of enabled channels
             enabled_channels = []
-            
+
             # Check each channel type
             if config.channels.telegram.enabled:
                 enabled_channels.append("telegram")
@@ -1268,7 +1300,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                 enabled_channels.append("mochat")
             if config.channels.qq.enabled:
                 enabled_channels.append("qq")
-            
+
             # Send alert to each enabled channel
             for channel in enabled_channels:
                 try:
@@ -1283,7 +1315,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                                 content=alert_message
                             )
                             await self.bus.publish_outbound(msg)
-                    
+
                     elif channel == "whatsapp":
                         # WhatsApp: send to allowed phones
                         for phone in config.channels.whatsapp.allow_from:
@@ -1293,12 +1325,12 @@ Respond with ONLY valid JSON, no markdown fences."""
                                 content=alert_message
                             )
                             await self.bus.publish_outbound(msg)
-                    
+
                     elif channel == "discord":
                         # Discord: this would need special handling for DMs
                         # For now, we'll skip as it requires more complex setup
                         pass
-                    
+
                     elif channel == "email":
                         # Email: send to allowed addresses
                         for email in config.channels.email.allow_from:
@@ -1308,17 +1340,17 @@ Respond with ONLY valid JSON, no markdown fences."""
                                 content=alert_message
                             )
                             await self.bus.publish_outbound(msg)
-                    
+
                     elif channel in ["feishu", "dingtalk", "slack", "mochat", "qq"]:
                         # These channels would need their specific broadcast mechanisms
                         # For now, we'll use a generic approach if available
                         # In practice, each channel handler would need to implement broadcast
                         pass
-                        
+
                 except Exception as e:
                     # Log error but continue trying other channels
                     logger.error(f"Failed to send budget alert to {channel}: {e}")
-                    
+
         except Exception as e:
             logger.error(f"Error broadcasting budget alert: {e}")
 
@@ -1331,13 +1363,13 @@ Respond with ONLY valid JSON, no markdown fences."""
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
-        
+
         Args:
             content: The message content.
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
-        
+
         Returns:
             The agent's response.
         """
@@ -1348,6 +1380,6 @@ Respond with ONLY valid JSON, no markdown fences."""
             chat_id=chat_id,
             content=content
         )
-        
+
         response = await self._process_message(msg, session_key=session_key)
         return response.content if response else ""

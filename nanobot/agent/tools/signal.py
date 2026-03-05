@@ -1,113 +1,103 @@
-"""Signal tool for sending notifications to the orchestrator."""
+﻿"""Signal tool for SubAgent to communicate with Orchestrator."""
 
+import json
+import time
 from typing import Any
+
 from nanobot.agent.tools.base import Tool
 
 
 class SignalTool(Tool):
     """
-    Tool for SubAgents to send signals/notifications to the Orchestrator.
-    
-    This allows SubAgents to report important events, request help,
-    or notify about progress without ending the task.
+    Tool for SubAgent to send signals to the Orchestrator.
+
+    Signals allow SubAgents to proactively report status or request help,
+    enabling more effective monitoring and intervention.
     """
-    
+
     name = "signal"
-    description = "Send a signal notification to the orchestrator. Use this to report important events, request guidance, or notify about blockers."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "type": {
-                "type": "string",
-                "enum": ["progress", "blocker", "help", "checkpoint", "custom"],
-                "description": "Type of signal to send"
-            },
-            "message": {
-                "type": "string",
-                "description": "The signal message content"
-            },
-            "severity": {
-                "type": "string",
-                "enum": ["info", "warning", "error"],
-                "default": "info",
-                "description": "Severity level of the signal"
-            },
-            "data": {
-                "type": "object",
-                "description": "Optional additional data to include with the signal"
-            }
-        },
-        "required": ["type", "message"]
+    description = "Send a status signal to the orchestrator. Use this to report progress, warn about long operations, or request help when stuck."
+
+    # Signal types with descriptions
+    SIGNAL_TYPES = {
+        "progress": "Report normal progress (resets idle timer)",
+        "will_take_long": "Warn that current operation will take a long time (e.g., installing packages, running tests)",
+        "stuck": "Report that you're stuck and need a hint",
+        "need_help": "Request model switch/rescue due to inability to proceed",
     }
-    
-    def __init__(self, bus=None, task_id: str | None = None):
+
+    def __init__(self, supervisor: Any = None, task_id: str | None = None):
         """
         Initialize the signal tool.
-        
+
         Args:
-            bus: The message bus for publishing signals.
-            task_id: The task ID of the SubAgent using this tool.
+            supervisor: The AgentSupervisor instance to receive signals.
+                       If None, signals will be logged but not processed.
+            task_id: The ID of the task using this tool.
         """
-        self.bus = bus
+        self.supervisor = supervisor
         self.task_id = task_id
-    
-    def set_context(self, task_id: str) -> None:
-        """Set the task ID context for this tool."""
-        self.task_id = task_id
-    
-    async def execute(
-        self,
-        type: str,
-        message: str,
-        severity: str = "info",
-        data: dict[str, Any] | None = None,
-    ) -> str:
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        """JSON Schema for tool parameters."""
+        return {
+            "type": "object",
+            "properties": {
+                "signal_type": {
+                    "type": "string",
+                    "enum": list(self.SIGNAL_TYPES.keys()),
+                    "description": "The type of signal to send:\n" + "\n".join(f"- {k}: {v}" for k, v in self.SIGNAL_TYPES.items())
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Optional message describing the situation"
+                }
+            },
+            "required": ["signal_type"]
+        }
+
+    async def execute(self, signal_type: str, message: str = "", **kwargs: Any) -> str:
         """
         Execute the signal tool.
-        
+
         Args:
-            type: Type of signal (progress, blocker, help, checkpoint, custom).
-            message: The signal message content.
-            severity: Severity level (info, warning, error).
-            data: Optional additional data.
-        
+            signal_type: The type of signal to send
+            message: Optional message describing the situation
+
         Returns:
-            Confirmation message.
+            Confirmation message
         """
-        from datetime import datetime
-        from loguru import logger
-        
-        signal_data = {
-            "type": type,
-            "message": message,
-            "severity": severity,
-            "task_id": self.task_id,
-            "timestamp": datetime.now().isoformat(),
-            "data": data or {}
-        }
-        
+        if signal_type not in self.SIGNAL_TYPES:
+            return f"Error: Unknown signal type '{signal_type}'. Valid types: {list(self.SIGNAL_TYPES.keys())}"
+
         # Log the signal
-        log_level = {
-            "info": logger.info,
-            "warning": logger.warning,
-            "error": logger.error
-        }.get(severity, logger.info)
-        
-        log_level(f"Signal [{type}] from task {self.task_id}: {message}")
-        
-        # If bus is available, publish the signal
-        if self.bus:
-            try:
-                from nanobot.bus.events import InboundMessage
-                msg = InboundMessage(
-                    channel="system",
-                    sender_id=f"subagent:{self.task_id}",
-                    chat_id="system:signals",
-                    content=f"[Signal:{type}] {message}",
-                    metadata=signal_data
-                )
-                await self.bus.publish_inbound(msg)
-            except Exception as e:
-                logger.error(f"Failed to publish signal: {e}")
-        
-        return f"Signal sent: [{severity}] {type} - {message}"
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] Signal: {signal_type}"
+        if message:
+            log_entry += f" - {message}"
+
+        # If supervisor is available, process the signal
+        if self.supervisor and self.task_id:
+            # For 'progress' signal, mark heartbeat as detected
+            if signal_type == "progress":
+                # The supervisor will detect heartbeat naturally through ActivityLog
+                pass
+
+            # For 'stuck' signal, could trigger immediate hint
+            elif signal_type == "stuck":
+                # Log that SubAgent reported being stuck
+                from loguru import logger
+                logger.warning(f"SubAgent [{self.task_id}] reported stuck: {message}")
+                # Trigger L1 intervention immediately if supervisor supports it
+                if hasattr(self.supervisor, "trigger_intervention"):
+                     await self.supervisor.trigger_intervention(self.task_id, "stuck", message)
+
+            # For 'need_help' signal, could trigger L2 intervention
+            elif signal_type == "need_help":
+                from loguru import logger
+                logger.warning(f"SubAgent [{self.task_id}] requested help: {message}")
+                if hasattr(self.supervisor, "trigger_intervention"):
+                     await self.supervisor.trigger_intervention(self.task_id, "need_help", message)
+
+        return f"Signal '{signal_type}' sent successfully. {message if message else ''}"
